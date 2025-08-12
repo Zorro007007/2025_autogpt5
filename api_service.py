@@ -69,8 +69,6 @@ from phase2_requirements_orchestrator import (
     default_llm as p2_default_llm,
 )
 
-OPENAI_API_KEY="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"
-os.environ['OPENAI_API_KEY'] = str(OPENAI_API_KEY)
 
 # ======================================================
 # Database setup (SQLite by default, Postgres via env)
