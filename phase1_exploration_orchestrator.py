@@ -1,4 +1,5 @@
 """
+./phase1_exploration_orchestrator.py:
 3) Run a quick test at the bottom of this file or import `run_phase1_exploration`.
 
 Notes
@@ -112,6 +113,8 @@ class OpenAIChatClient(LLMClient):
     @retry(wait=wait_exponential(min=1, max=10), stop=stop_after_attempt(3))
     def complete_json(self, *, system: str, user: str, model_hint: Optional[str] = None) -> Dict[str, Any]:
         # We instruct the model to emit strict JSON. The SDK supports a JSON response format.
+        print("hallokes:  " + os.getenv("OPENAI_API_KEY"))
+
         resp = self._client.chat.completions.create(
             model=self.model, 
             response_format={"type": "json_object"},
@@ -393,7 +396,7 @@ def default_llm() -> LLMClient:
     - If OPENAI_API_KEY is set -> use OpenAI.
     - Else -> use Mock client (offline dev mode).
     """
-
+    print("hallokes:  " + os.getenv("OPENAI_API_KEY"))
     if os.getenv("OPENAI_API_KEY"):
         return OpenAIChatClient(os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
     return MockLLMClient()

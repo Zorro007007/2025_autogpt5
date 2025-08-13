@@ -1,4 +1,5 @@
 """
+./api_service.py
 FastAPI API for Phase 1 & 2 — Explore → Requirements (with pgvector memory)
 --------------------------------------------------------------------------
 
@@ -46,6 +47,8 @@ import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional, Dict, Any, Tuple
+from debate_engine import router as debate_router
+
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -121,6 +124,8 @@ class MemorySqlite(Base):  # used only when sqlite
     content = Column(Text, nullable=False)
     embedding = Column(Text, nullable=False)  # JSON list of floats
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -327,6 +332,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(debate_router, prefix="/debate", tags=["debate"])
 
 def get_db() -> Session:
     db = SessionLocal()
