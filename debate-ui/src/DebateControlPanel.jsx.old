@@ -1,0 +1,807 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+export default function DebateControlPanel() {
+  // Config
+  const [baseUrl, setBaseUrl] = useState("http://localhost:8001/debate");
+  const [threadId, setThreadId] = useState("");
+
+  // State
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState(null);
+
+  const [thread, setThread] = useState(null);
+  const [profiles, setProfiles] = useState({});   // id -> {id,name,role}
+  const [messages, setMessages] = useState([]);   // newest-first from API; we reverse to show chronological
+
+  const [autorun, setAutorun] = useState(false);
+  const [delayMs, setDelayMs] = useState(1500);
+  const [stepMode, setStepMode] = useState("mem"); // "mem" | "plain"
+  const [nSteps, setNSteps] = useState(3);
+
+  const [composer, setComposer] = useState("");
+  const [phase1, setPhase1] = useState(null);
+  const [phase2, setPhase2] = useState(null);
+
+  // Preview + decisions (may be no-ops if backend doesn't expose endpoints)
+  const [preview, setPreview] = useState(null);
+  const [decisions, setDecisions] = useState([]);
+
+  // NEW: local loading for participant types button
+  const [typesLoading, setTypesLoading] = useState(false);
+  const [typesSeededInfo, setTypesSeededInfo] = useState("");
+
+  // New thread creation UI
+  const [projectIdNew, setProjectIdNew] = useState("");
+  const [titleNew, setTitleNew] = useState("");
+  const [phaseNew, setPhaseNew] = useState("phase1-exploration");
+  const [initialMessageNew, setInitialMessageNew] = useState("");
+  const [contextNew, setContextNew] = useState("{}");
+  const [profileTypes, setProfileTypes] = useState([]); // [{id,key,display_name}]
+  const [selectedTypeKeys, setSelectedTypeKeys] = useState({}); // key -> bool
+
+  // Thread browser
+  const [projectFilter, setProjectFilter] = useState("");
+  const [threadList, setThreadList] = useState([]);
+
+  // NEW: Add participant UI state
+  const [addPid, setAddPid] = useState("");
+  const [addTypeKey, setAddTypeKey] = useState("");
+
+  const intervalRef = useRef(null);
+
+  const api = useMemo(() => {
+    const safeBase = baseUrl.replace(/\/$/, "");
+    return {
+      profiles: `${safeBase}/profiles`,
+      profileTypes: `${safeBase}/profile-types`,
+      seedProfiles: `${safeBase}/profiles/seed`,
+      thread: (id) => `${safeBase}/threads/${id}`,
+      threadsList: (project) =>
+        project ? `${safeBase}/threads?project_id=${encodeURIComponent(project)}` : `${safeBase}/threads`,
+      messages: (id) => `${safeBase}/threads/${id}/messages`,
+      postMessage: (id) => `${safeBase}/threads/${id}/messages`,
+      step: (id) => `${safeBase}/threads/${id}/${stepMode === "mem" ? "step_mem" : "step"}`,
+      autorun: (id, n) => `${safeBase}/threads/${id}/autorun?n=${n}`,
+      compileP1: (id) => `${safeBase}/threads/${id}/compile/phase1`,
+      compileP2: (id) => `${safeBase}/threads/${id}/compile/phase2`,
+      createThreadNew: (projectId) => `${safeBase}/projects/${projectId}/threads/new`,
+      // Optional extras (safe to leave; will simply 404 if not implemented)
+      stepPreview: (id) => `${safeBase}/threads/${id}/step_preview`,
+      decisions: (id) => `${safeBase}/threads/${id}/decisions`,
+      // NEW endpoints
+      setCursor: (id) => `${safeBase}/threads/${id}/cursor`,
+      addParticipant: (id) => `${safeBase}/threads/${id}/participants`,
+    };
+  }, [baseUrl, stepMode]);
+
+  const loadProfiles = useCallback(async () => {
+    const r = await fetch(api.profiles);
+    if (!r.ok) throw new Error(`profiles: ${r.status}`);
+    const data = await r.json();
+    const map = {};
+    for (const p of data) map[p.id] = p;
+    setProfiles(map);
+  }, [api.profiles]);
+
+  // Returns array
+  const loadProfileTypes = useCallback(async () => {
+    const r = await fetch(api.profileTypes);
+    if (!r.ok) throw new Error(`profile-types: ${r.status}`);
+    const data = await r.json();
+    setProfileTypes(data);
+    return data;
+  }, [api.profileTypes]);
+
+  const loadProfileTypesOrSeed = useCallback(async () => {
+    setTypesLoading(true);
+    setTypesSeededInfo("");
+    setError(null);
+    try {
+      let types = await loadProfileTypes();
+      if (!types || types.length === 0) {
+        // Auto-seed defaults, then retry
+        const seedResp = await fetch(api.seedProfiles, { method: "POST" });
+        if (!seedResp.ok) {
+          const t = await seedResp.text().catch(() => "");
+          throw new Error(`seeding defaults failed: ${seedResp.status}${t ? ` ${t}` : ""}`);
+        }
+        const seed = await seedResp.json().catch(() => ({}));
+        setTypesSeededInfo(`Seeded default profiles (inserted: ${seed?.inserted ?? "?"}).`);
+        types = await loadProfileTypes();
+        // After seeding, also refresh /profiles so IDs are in the map
+        await loadProfiles();
+      }
+    } catch (e) {
+      setError(e?.message || String(e));
+    } finally {
+      setTypesLoading(false);
+    }
+  }, [api.seedProfiles, loadProfileTypes, loadProfiles]);
+
+  const loadThread = useCallback(async (id) => {
+    const r = await fetch(api.thread(id));
+    if (!r.ok) throw new Error(`thread ${id}: ${r.status}`);
+    const data = await r.json();
+    setThread(data);
+  }, [api]);
+
+  const loadMessages = useCallback(async (id) => {
+    const r = await fetch(api.messages(id));
+    if (!r.ok) throw new Error(`messages ${id}: ${r.status}`);
+    const data = await r.json();
+    setMessages(data); // newest-first
+  }, [api]);
+
+  const loadThreadsList = useCallback(async () => {
+    const r = await fetch(api.threadsList(projectFilter || undefined));
+    if (!r.ok) throw new Error(`threads list: ${r.status}`);
+    const data = await r.json();
+    setThreadList(data);
+  }, [api, projectFilter]);
+
+  // Optional: preview/decisions loaders
+  const loadPreview = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    try {
+      const r = await fetch(api.stepPreview(threadId));
+      if (!r.ok) throw new Error(`preview: ${r.status}`);
+      const data = await r.json();
+      setPreview(data);
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  }, [threadId, api]);
+
+  const loadDecisions = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    try {
+      const r = await fetch(api.decisions(threadId));
+      if (!r.ok) throw new Error(`decisions: ${r.status}`);
+      const data = await r.json();
+      setDecisions(data);
+    } catch (e) {
+      setError(e?.message || String(e));
+    }
+  }, [threadId, api]);
+
+  const refreshAll = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    try {
+      setLoading(true);
+      await Promise.all([
+        loadProfiles(),
+        loadThread(threadId),
+        loadMessages(threadId),
+        loadDecisions(), // safe if 404 → will surface error
+      ]);
+    } catch (e) {
+      setError(e?.message || String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [threadId, loadProfiles, loadThread, loadMessages, loadDecisions]);
+
+  // Autorun loop
+  useEffect(() => {
+    if (!autorun) {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      intervalRef.current = null;
+      return;
+    }
+    if (!threadId) return;
+
+    let busy = false;
+    intervalRef.current = setInterval(async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        await stepOnce();
+      } catch (e) {
+        console.error(e);
+        setError(e?.message || String(e));
+        setAutorun(false);
+      } finally {
+        busy = false;
+      }
+    }, Math.max(250, Number(delayMs) || 1000));
+
+    return () => {
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    };
+  }, [autorun, delayMs, threadId, stepMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e) => {
+      const t = e.target;
+      if (t && t.tagName === "TEXTAREA") return;
+      if (e.code === "Space") {
+        e.preventDefault();
+        stepOnce();
+      } else if (e.key && e.key.toLowerCase() === "a") {
+        setAutorun((x) => !x);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [threadId, stepMode]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const stepOnce = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    const r = await fetch(api.step(threadId), { method: "POST" });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`step failed: ${r.status}${text ? ` ${text}` : ""}`);
+    }
+    await loadThread(threadId);
+    await loadMessages(threadId);
+    await loadDecisions();
+    setPreview(null);
+  }, [threadId, api, loadThread, loadMessages, loadDecisions]);
+
+  const runNSteps = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    const r = await fetch(api.autorun(threadId, Math.max(1, Number(nSteps) || 1)), { method: "POST" });
+    if (!r.ok) {
+      const text = await r.text().catch(() => "");
+      throw new Error(`autorun failed: ${r.status}${text ? ` ${text}` : ""}`);
+    }
+    await loadThread(threadId);
+    await loadMessages(threadId);
+    await loadDecisions();
+    setPreview(null);
+  }, [threadId, api, nSteps, loadThread, loadMessages, loadDecisions]);
+
+  const sendUserMessage = useCallback(async () => {
+    if (!composer.trim() || !threadId) return;
+    setError(null);
+    const r = await fetch(api.postMessage(threadId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: composer.trim(), content_type: "text" }),
+    });
+    if (!r.ok) throw new Error(`post message failed: ${r.status}`);
+    setComposer("");
+    await loadThread(threadId);
+    await loadMessages(threadId);
+  }, [composer, threadId, api, loadThread, loadMessages]);
+
+  // NEW: Ask PM to suggest a profile, then hand PM the floor
+  const askPMToSuggestProfile = useCallback(async () => {
+    if (!threadId || !thread) return;
+    setError(null);
+    const prompt = "PM: Based on the current discussion, suggest one additional agent profile (type key) to add next, with a 1–2 sentence rationale and the exact type key.";
+    const r = await fetch(api.postMessage(threadId), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ content: prompt, content_type: "text" }),
+    });
+    if (!r.ok) throw new Error(`post message failed: ${r.status}`);
+    // find PM among current participants
+    const pmId = (thread?.participants || []).find((id) => (profiles[id]?.role || "").toLowerCase() === "pm");
+    if (pmId) {
+      const r2 = await fetch(api.setCursor(threadId), {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ next_speaker_id: pmId }),
+      });
+      if (!r2.ok) throw new Error(`set cursor failed: ${r2.status}`);
+    }
+    await loadThread(threadId);
+    await loadMessages(threadId);
+  }, [threadId, thread, profiles, api, loadThread, loadMessages]);
+
+  const doCompileP1 = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    const r = await fetch(api.compileP1(threadId), { method: "POST" });
+    if (!r.ok) throw new Error(`compile p1: ${r.status}`);
+    const data = await r.json();
+    setPhase1(data.artifact);
+  }, [threadId, api]);
+
+  const doCompileP2 = useCallback(async () => {
+    if (!threadId) return;
+    setError(null);
+    const r = await fetch(api.compileP2(threadId), { method: "POST" });
+    if (!r.ok) throw new Error(`compile p2: ${r.status}`);
+    const data = await r.json();
+    setPhase2(data);
+  }, [threadId, api]);
+
+  const createNewThread = useCallback(async () => {
+    if (!projectIdNew || !titleNew) {
+      setError("Project ID and Title are required to create a thread.");
+      return;
+    }
+    const keys = Object.keys(selectedTypeKeys).filter((k) => selectedTypeKeys[k]);
+    if (keys.length === 0) {
+      setError("Select at least one participant type.");
+      return;
+    }
+    let ctx;
+    const trimmed = (contextNew || "").trim();
+    if (trimmed) {
+      try { ctx = JSON.parse(trimmed); } catch {
+        setError("Context must be valid JSON.");
+        return;
+      }
+    }
+    setError(null);
+    const payload = {
+      phase: phaseNew,
+      title: titleNew,
+      participant_type_keys: keys,
+      context: ctx,
+      initial_message: initialMessageNew || undefined,
+    };
+    const r = await fetch(api.createThreadNew(projectIdNew), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!r.ok) {
+      const text = await r.text();
+      throw new Error(`create thread failed: ${r.status} ${text}`);
+    }
+    const data = await r.json();
+    setThreadId(data.id);
+    setThread(data);
+    setPreview(null);
+    setDecisions([]);
+    await Promise.all([loadProfiles(), loadThread(data.id), loadMessages(data.id)]);
+  }, [api, projectIdNew, titleNew, phaseNew, contextNew, initialMessageNew, selectedTypeKeys, loadProfiles, loadThread, loadMessages]);
+
+  // Derived
+  const chronologicalMessages = useMemo(() => [...messages].reverse(), [messages]);
+  const participantIds = useMemo(() => (thread?.participants || []), [thread]);
+  const participantMap = useMemo(() => {
+    const out = {};
+    for (const id of participantIds) {
+      const p = profiles[id];
+      if (p) out[id] = { name: p.name, role: p.role };
+    }
+    return out;
+  }, [participantIds, profiles]);
+
+  const nextSpeakerIdx = thread ? thread.cursor % (participantIds.length || 1) : 0;
+  const nextSpeakerId = participantIds[nextSpeakerIdx];
+
+  function fmtMessage(m) {
+    if (m.sender_type === "user") {
+      return { who: "You", text: typeof m.content === "string" ? m.content : JSON.stringify(m.content) };
+    }
+    const meta = participantMap[m.sender_agent_id] || { name: (m.sender_agent_id || "").slice(0, 6) || "Agent", role: "" };
+    let text = "";
+    let proposals;
+    let questions;
+    if (typeof m.content === "object" && m.content !== null) {
+      text = String(m.content.message ?? "");
+      proposals = Array.isArray(m.content.proposals) ? m.content.proposals : undefined;
+      questions = Array.isArray(m.content.questions) ? m.content.questions : undefined;
+    } else {
+      text = String(m.content);
+    }
+    return { who: meta.name, role: meta.role, text, proposals, questions };
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 text-gray-900">
+      <div className="max-w-6xl mx-auto p-4 sm:p-6">
+        <header className="flex flex-col sm:flex-row gap-3 sm:items-end sm:justify-between">
+          <div>
+            <h1 className="text-2xl font-bold">Debate Control Panel</h1>
+            <p className="text-sm text-gray-600">Visualize and steer your multi-agent, turn-based debates.</p>
+          </div>
+          <div className="flex flex-col sm:flex-row gap-2">
+            <input
+              className="border rounded px-3 py-2 w-full sm:w-72"
+              placeholder="FastAPI base (…/debate)"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+            />
+            <input
+              className="border rounded px-3 py-2 w-full sm:w-72"
+              placeholder="Thread ID"
+              value={threadId}
+              onChange={(e) => setThreadId(e.target.value)}
+            />
+            <button
+              className="px-4 py-2 rounded bg-gray-900 text-white hover:opacity-90"
+              onClick={refreshAll}
+              disabled={!threadId || loading}
+            >
+              {loading ? "Loading…" : "Load"}
+            </button>
+          </div>
+        </header>
+
+        {error && <div className="mt-4 p-3 rounded bg-red-100 text-red-800 text-sm">{String(error)}</div>}
+        {typesSeededInfo && <div className="mt-2 p-2 rounded bg-emerald-50 text-emerald-800 text-xs">{typesSeededInfo}</div>}
+
+        {/* New Thread */}
+        <section className="mt-6">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold">Create New Thread</h2>
+            <button
+              type="button"
+              className={`text-sm underline ${typesLoading ? "opacity-60 cursor-not-allowed" : ""}`}
+              onClick={loadProfileTypesOrSeed}
+              disabled={typesLoading}
+              title="Fetch /profile-types; auto-seed defaults if empty"
+            >
+              {typesLoading ? "Loading types…" : "Load participant types"}
+            </button>
+          </div>
+          <div className="mt-2 grid grid-cols-1 lg:grid-cols-3 gap-3">
+            <div className="border rounded-xl p-3 bg-white space-y-2">
+              <label className="text-sm">Project ID</label>
+              <input className="border rounded px-2 py-1 w-full" value={projectIdNew} onChange={(e)=>setProjectIdNew(e.target.value)} placeholder="proj-123" />
+              <label className="text-sm">Title</label>
+              <input className="border rounded px-2 py-1 w-full" value={titleNew} onChange={(e)=>setTitleNew(e.target.value)} placeholder="My Debate" />
+              <label className="text-sm">Phase</label>
+              <input className="border rounded px-2 py-1 w-full" value={phaseNew} onChange={(e)=>setPhaseNew(e.target.value)} placeholder="phase1-exploration" />
+            </div>
+            <div className="border rounded-xl p-3 bg-white space-y-2">
+              <div className="text-sm font-medium">Participants (type keys)</div>
+              <div className="grid grid-cols-2 gap-2">
+                {profileTypes.length === 0 && <div className="text-xs text-gray-500 col-span-2">Click "Load participant types" (auto-seeds defaults if empty).</div>}
+                {profileTypes.map((pt) => (
+                  <label key={pt.id} className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={!!selectedTypeKeys[pt.key]}
+                      onChange={(e)=> setSelectedTypeKeys((prev)=> ({...prev, [pt.key]: e.target.checked}))}
+                    />
+                    <span><span className="font-mono text-xs">{pt.key}</span> · {pt.display_name}</span>
+                  </label>
+                ))}
+              </div>
+              <div className="text-xs text-gray-500">Defaults after seeding: pm, frontend, backend, architect, qa, critic.</div>
+            </div>
+            <div className="border rounded-xl p-3 bg-white space-y-2">
+              <label className="text-sm">Initial user message (optional)</label>
+              <textarea className="border rounded px-2 py-1 w-full min-h-[60px]" value={initialMessageNew} onChange={(e)=>setInitialMessageNew(e.target.value)} placeholder="Kick off the discussion…" />
+              <label className="text-sm">Context JSON (optional)</label>
+              <textarea className="border rounded px-2 py-1 w-full min-h-[60px] font-mono text-xs" value={contextNew} onChange={(e)=>setContextNew(e.target.value)} placeholder='{"goals":["…"],"constraints":["…"]}' />
+              <button className="px-3 py-1.5 rounded bg-emerald-600 text-white" onClick={createNewThread}>Create & Load</button>
+            </div>
+          </div>
+        </section>
+
+        {/* Participants */}
+        {thread && (
+          <section className="mt-6">
+            <div className="flex items-center justify-between">
+              <h2 className="font-semibold">Participants</h2>
+              <div className="text-sm text-gray-600">Phase: <span className="font-mono">{thread.phase}</span></div>
+            </div>
+            <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+              {participantIds.map((id, idx) => {
+                const p = participantMap[id];
+                const isNext = id === nextSpeakerId;
+                return (
+                  <div key={id} className={`border rounded-xl p-3 flex items-center justify-between ${isNext ? "bg-yellow-50 border-yellow-300" : "bg-white"}`}>
+                    <div>
+                      <div className="font-medium">{p?.name || id.slice(0,6)}</div>
+                      <div className="text-xs text-gray-600">{p?.role || "agent"}</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <div className="text-xs text-gray-500">#{idx + 1}</div>
+                      {/* NEW: Speak next */}
+                      <button
+                        className="text-xs px-2 py-1 rounded border bg-white hover:bg-gray-100"
+                        onClick={async () => {
+                          try {
+                            setError(null);
+                            const r = await fetch(api.setCursor(thread.id), {
+                              method: "PATCH",
+                              headers: { "Content-Type": "application/json" },
+                              body: JSON.stringify({ next_speaker_id: id }),
+                            });
+                            if (!r.ok) throw new Error(`set cursor: ${r.status}`);
+                            await loadThread(thread.id);
+                          } catch (e) {
+                            setError(e?.message || String(e));
+                          }
+                        }}
+                        title="Force this participant to speak next"
+                      >
+                        Speak next
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* NEW: Add participant */}
+            <div className="mt-3 border rounded-xl p-3 bg-white">
+              <div className="text-sm font-medium mb-2">Add participant</div>
+              <div className="flex flex-wrap items-end gap-2">
+                <div className="flex flex-col">
+                  <label className="text-xs text-gray-600 mb-1">Existing profile</label>
+                  <select
+                    className="border rounded px-2 py-1 min-w-[220px]"
+                    value={addPid}
+                    onChange={(e) => { setAddPid(e.target.value); if (e.target.value) setAddTypeKey(""); }}
+                  >
+                    <option value="">— choose profile —</option>
+                    {Object.values(profiles).map((p) => (
+                      <option key={p.id} value={p.id}>{p.name} · {p.role}</option>
+                    ))}
+                  </select>
+                </div>
+                <div className="flex flex-col">
+                  <label className="text-xs text-gray-600 mb-1">…or by type key</label>
+                  <select
+                    className="border rounded px-2 py-1 min-w-[220px]"
+                    value={addTypeKey}
+                    onChange={(e) => { setAddTypeKey(e.target.value); if (e.target.value) setAddPid(""); }}
+                  >
+                    <option value="">— choose type key —</option>
+                    {profileTypes.map((pt) => (
+                      <option key={pt.id} value={pt.key}>{pt.key} · {pt.display_name}</option>
+                    ))}
+                  </select>
+                </div>
+                <button
+                  className="px-3 py-1.5 rounded bg-emerald-600 text-white"
+                  disabled={!thread || (!addPid && !addTypeKey)}
+                  onClick={async () => {
+                    try {
+                      setError(null);
+                      const prev = (thread?.participants || []).slice();
+                      const body = addPid ? { participant_id: addPid } : { type_key: addTypeKey };
+                      const r = await fetch(api.addParticipant(thread.id), {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify(body),
+                      });
+                      if (!r.ok) throw new Error(`add participant: ${r.status}`);
+                      const updated = await r.json();
+                      setThread(updated);
+                      // figure out newly added id (if any), then set cursor to it
+                      const after = updated.participants || [];
+                      const added = after.find((x) => !prev.includes(x));
+                      if (added) {
+                        const r2 = await fetch(api.setCursor(updated.id), {
+                          method: "PATCH",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ next_speaker_id: added }),
+                        });
+                        if (!r2.ok) throw new Error(`set cursor: ${r2.status}`);
+                        await loadThread(updated.id);
+                      }
+                      // housekeeping
+                      setAddPid("");
+                      setAddTypeKey("");
+                      await loadProfiles(); // ensure profile map is fresh
+                    } catch (e) {
+                      setError(e?.message || String(e));
+                    }
+                  }}
+                >
+                  Add & speak next
+                </button>
+                <button
+                  className="text-sm underline"
+                  onClick={async () => {
+                    try {
+                      await loadProfileTypes();
+                    } catch (e) {
+                      setError(e?.message || String(e));
+                    }
+                  }}
+                >
+                  Refresh type keys
+                </button>
+              </div>
+              <p className="text-xs text-gray-500 mt-2">
+                Tip: choose either an existing profile or a type key; the server will pick the first profile for that type.
+              </p>
+            </div>
+          </section>
+        )}
+
+        {/* Controls */}
+        <section className="mt-6">
+          <h2 className="font-semibold">Controls</h2>
+          <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div className="border rounded-xl p-3 bg-white">
+              <div className="flex flex-wrap items-center gap-2">
+                <select className="border rounded px-2 py-1" value={stepMode} onChange={(e) => setStepMode(e.target.value)}>
+                  <option value="mem">Step with memory</option>
+                  <option value="plain">Plain step</option>
+                </select>
+                <button className="px-3 py-1.5 rounded bg-blue-600 text-white hover:opacity-90" onClick={stepOnce} disabled={!threadId} title="Shortcut: Space">
+                  Step once
+                </button>
+                <div className="flex items-center gap-2">
+                  <label className="text-sm">Auto-run</label>
+                  <button
+                    className={`px-3 py-1.5 rounded ${autorun ? "bg-green-600" : "bg-gray-700"} text-white hover:opacity-90`}
+                    onClick={() => setAutorun((x) => !x)}
+                    disabled={!threadId}
+                    title="Shortcut: A"
+                  >
+                    {autorun ? "On" : "Off"}
+                  </button>
+                  <input className="border rounded px-2 py-1 w-24" type="number" min={250} step={250} value={delayMs} onChange={(e) => setDelayMs(Number(e.target.value) || 1000)} />
+                  <span className="text-sm text-gray-600">ms delay</span>
+                </div>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2">
+                <input className="border rounded px-2 py-1 w-24" type="number" min={1} value={nSteps} onChange={(e) => setNSteps(Number(e.target.value) || 1)} />
+                <button className="px-3 py-1.5 rounded bg-indigo-600 text-white hover:opacity-90" onClick={runNSteps} disabled={!threadId}>
+                  Run N steps
+                </button>
+                <button className="px-3 py-1.5 rounded bg-gray-100 text-gray-900 border" onClick={() => refreshAll()} disabled={!threadId}>
+                  Refresh
+                </button>
+                {/* Optional: preview + decisions */}
+                <button className="px-3 py-1.5 rounded bg-amber-600 text-white" onClick={loadPreview} disabled={!threadId}>
+                  Preview next turn
+                </button>
+                <button className="px-3 py-1.5 rounded bg-teal-700 text-white" onClick={loadDecisions} disabled={!threadId}>
+                  Load decisions
+                </button>
+                {/* NEW: Ask PM to suggest a profile */}
+                <button className="px-3 py-1.5 rounded bg-amber-700 text-white" onClick={askPMToSuggestProfile} disabled={!threadId}>
+                  Ask PM to suggest a profile
+                </button>
+              </div>
+            </div>
+
+            <div className="border rounded-xl p-3 bg-white">
+              <div className="font-medium">Compile</div>
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button className="px-3 py-1.5 rounded bg-purple-600 text-white" onClick={doCompileP1} disabled={!threadId}>Phase-1 artifact</button>
+                <button className="px-3 py-1.5 rounded bg-purple-700 text-white" onClick={doCompileP2} disabled={!threadId}>Phase-2 reqs+tests</button>
+              </div>
+              {(phase1 || phase2) && (
+                <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                  {phase1 && <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{JSON.stringify(phase1, null, 2)}</pre>}
+                  {phase2 && <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{JSON.stringify(phase2, null, 2)}</pre>}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {(preview || (decisions && decisions.length > 0)) && (
+            <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3">
+              {preview && (
+                <div className="border rounded-xl bg-white p-3">
+                  <div className="font-medium">Step Preview</div>
+                  <div className="mt-2 grid grid-cols-1 gap-3 text-xs">
+                    <div>
+                      <div className="text-gray-600 mb-1">System Prompt</div>
+                      <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{preview.system_prompt}</pre>
+                    </div>
+                    <div>
+                      <div className="text-gray-600 mb-1">User Prompt</div>
+                      <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{preview.user_prompt}</pre>
+                    </div>
+                    <div>
+                      <div className="text-gray-600 mb-1">Schema</div>
+                      <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{JSON.stringify(preview.schema, null, 2)}</pre>
+                    </div>
+                    {preview.memory_snippets?.length > 0 && (
+                      <div>
+                        <div className="text-gray-600 mb-1">Retrieved snippets</div>
+                        <ul className="list-disc pl-5">
+                          {preview.memory_snippets.map((s,i)=><li key={i}>{s}</li>)}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {decisions?.length > 0 && (
+                <div className="border rounded-xl bg-white p-3">
+                  <div className="font-medium">Decisions (proposed)</div>
+                  <ul className="mt-2 space-y-1 text-sm">
+                    {decisions.map(d => (
+                      <li key={d.id} className="border rounded p-2 bg-gray-50">
+                        <div className="flex items-center justify-between">
+                          <span>{d.text}</span>
+                          <span className="text-xs px-2 py-0.5 rounded bg-gray-200">{d.status}</span>
+                        </div>
+                        <div className="text-xs text-gray-500 mt-1">
+                          id: <span className="font-mono">{d.id}</span>
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </section>
+
+        {/* Threads browser */}
+        <section className="mt-6">
+          <div className="flex items-center justify-between">
+            <h2 className="font-semibold">Browse Threads</h2>
+            <div className="flex items-center gap-2">
+              <input className="border rounded px-2 py-1" placeholder="Filter by project_id" value={projectFilter} onChange={(e)=>setProjectFilter(e.target.value)} />
+              <button className="px-3 py-1.5 rounded bg-gray-800 text-white" onClick={loadThreadsList}>Load Threads</button>
+            </div>
+          </div>
+          {threadList.length > 0 && (
+            <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-2">
+              {threadList.map((t) => (
+                <button key={t.id}
+                  onClick={async ()=>{ setThreadId(t.id); setThread(t); setPreview(null); setDecisions([]); await loadProfiles(); await loadMessages(t.id); }}
+                  className="text-left border rounded-xl p-3 bg-white hover:border-gray-400"
+                >
+                  <div className="font-medium">{t.title}</div>
+                  <div className="text-xs text-gray-600">id: <span className="font-mono">{t.id}</span></div>
+                  <div className="text-xs text-gray-600">
+                    project: <span className="font-mono">{t.project_id}</span> · phase: <span className="font-mono">{t.phase}</span>
+                  </div>
+                  <div className="text-xs text-gray-600">participants: {t.participants?.length ?? 0}</div>
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        {/* Transcript */}
+        <section className="mt-6">
+          <h2 className="font-semibold">Transcript</h2>
+          <div className="mt-2 border rounded-xl bg-white">
+            <div className="p-3 h-[420px] overflow-auto space-y-3">
+              {chronologicalMessages.map((m, i) => {
+                const fm = fmtMessage(m);
+                const isUser = m.sender_type === "user";
+                return (
+                  <div key={m.id || i} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                    <div className={`max-w-[80%] rounded-2xl px-3 py-2 border ${isUser ? "bg-blue-50 border-blue-200" : "bg-gray-50"}`}>
+                      <div className="text-xs text-gray-500 mb-1">
+                        {isUser ? fm.who : `${fm.who}${fm.role ? ` · ${fm.role}` : ""}`}
+                      </div>
+                      <div className="whitespace-pre-wrap">{fm.text}</div>
+                      {fm.proposals?.length > 0 && (
+                        <ul className="mt-2 list-disc pl-5 text-sm text-gray-700">
+                          {fm.proposals.map((p, idx) => <li key={idx}>Proposal: {p}</li>)}
+                        </ul>
+                      )}
+                      {fm.questions?.length > 0 && (
+                        <ul className="mt-2 list-disc pl-5 text-sm text-gray-700">
+                          {fm.questions.map((q, idx) => <li key={idx}>Question: {q}</li>)}
+                        </ul>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="border-t p-3 flex items-center gap-2">
+              <textarea
+                className="flex-1 border rounded-lg px-3 py-2 min-h-[44px]"
+                placeholder="Type your message…"
+                value={composer}
+                onChange={(e) => setComposer(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendUserMessage(); }}
+              />
+              <button className="px-4 py-2 rounded bg-gray-900 text-white" onClick={sendUserMessage} disabled={!threadId || !composer.trim()}>
+                Send
+              </button>
+            </div>
+          </div>
+          <p className="mt-2 text-xs text-gray-500">
+            Shortcuts: <kbd className="px-1 border rounded">Space</kbd> step once, <kbd className="px-1 border rounded">A</kbd> toggle auto-run.
+          </p>
+        </section>
+      </div>
+    </div>
+  );
+}

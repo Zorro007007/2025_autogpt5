@@ -1,0 +1,400 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Debate Control Panel</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <!-- Tailwind (play CDN, dev-only) -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- React 18 UMD + Babel (for JSX in browser, dev-only) -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  </head>
+  <body class="bg-gray-50">
+    <div id="root"></div>
+
+    <script type="text/babel">
+      const { useCallback, useEffect, useMemo, useRef, useState } = React;
+
+      function DebateControlPanel() {
+        const [baseUrl, setBaseUrl] = useState("http://localhost:8001/debate");
+        const [threadId, setThreadId] = useState("");
+
+        const [loading, setLoading] = useState(false);
+        const [error, setError] = useState(null);
+
+        const [thread, setThread] = useState(null);
+        const [profiles, setProfiles] = useState({});
+        const [messages, setMessages] = useState([]);
+
+        const [autorun, setAutorun] = useState(false);
+        const [delayMs, setDelayMs] = useState(1500);
+        const [stepMode, setStepMode] = useState("mem");
+        const [nSteps, setNSteps] = useState(3);
+
+        const [composer, setComposer] = useState("");
+        const [phase1, setPhase1] = useState(null);
+        const [phase2, setPhase2] = useState(null);
+
+        const intervalRef = useRef(null);
+
+        const api = useMemo(() => {
+          const safeBase = baseUrl.replace(/\/$/, "");
+          return {
+            profiles: `${safeBase}/profiles`,
+            thread: (id) => `${safeBase}/threads/${id}`,
+            messages: (id) => `${safeBase}/threads/${id}/messages`,
+            postMessage: (id) => `${safeBase}/threads/${id}/messages`,
+            step: (id) => `${safeBase}/threads/${id}/${stepMode === "mem" ? "step_mem" : "step"}`,
+            autorun: (id, n) => `${safeBase}/threads/${id}/autorun?n=${n}`,
+            compileP1: (id) => `${safeBase}/threads/${id}/compile/phase1`,
+            compileP2: (id) => `${safeBase}/threads/${id}/compile/phase2`,
+          };
+        }, [baseUrl, stepMode]);
+
+        const loadProfiles = useCallback(async () => {
+          const r = await fetch(api.profiles);
+          if (!r.ok) throw new Error(`profiles: ${r.status}`);
+          const data = await r.json();
+          const map = {};
+          for (const p of data) map[p.id] = p;
+          setProfiles(map);
+        }, [api.profiles]);
+
+        const loadThread = useCallback(async (id) => {
+          const r = await fetch(api.thread(id));
+          if (!r.ok) throw new Error(`thread ${id}: ${r.status}`);
+          const data = await r.json();
+          setThread(data);
+        }, [api]);
+
+        const loadMessages = useCallback(async (id) => {
+          const r = await fetch(api.messages(id));
+          if (!r.ok) throw new Error(`messages ${id}: ${r.status}`);
+          const data = await r.json();
+          setMessages(data); // newest-first
+        }, [api]);
+
+        const refreshAll = useCallback(async () => {
+          if (!threadId) return;
+          setError(null);
+          try {
+            setLoading(true);
+            await Promise.all([loadProfiles(), loadThread(threadId), loadMessages(threadId)]);
+          } catch (e) {
+            setError(e?.message || String(e));
+          } finally {
+            setLoading(false);
+          }
+        }, [threadId, loadProfiles, loadThread, loadMessages]);
+
+        // Autorun loop
+        useEffect(() => {
+          if (!autorun) {
+            if (intervalRef.current) clearInterval(intervalRef.current);
+            intervalRef.current = null;
+            return;
+          }
+          if (!threadId) return;
+
+          let busy = false;
+          intervalRef.current = setInterval(async () => {
+            if (busy) return;
+            busy = true;
+            try {
+              await stepOnce();
+            } catch (e) {
+              console.error(e);
+              setAutorun(false);
+            } finally {
+              busy = false;
+            }
+          }, Math.max(250, Number(delayMs) || 1000));
+
+          return () => {
+            if (intervalRef.current) clearInterval(intervalRef.current);
+            intervalRef.current = null;
+          };
+        }, [autorun, delayMs, threadId, stepMode]); // eslint-disable-line
+
+        // Keyboard shortcuts
+        useEffect(() => {
+          const onKey = (e) => {
+            const t = e.target;
+            if (t && t.tagName === "TEXTAREA") return;
+            if (e.code === "Space") {
+              e.preventDefault();
+              stepOnce();
+            } else if (e.key && e.key.toLowerCase() === "a") {
+              setAutorun((x) => !x);
+            }
+          };
+          window.addEventListener("keydown", onKey);
+          return () => window.removeEventListener("keydown", onKey);
+        }, [threadId, stepMode]);
+
+        const stepOnce = useCallback(async () => {
+          if (!threadId) return;
+          const r = await fetch(api.step(threadId), { method: "POST" });
+          if (!r.ok) throw new Error(`step failed: ${r.status}`);
+          await loadThread(threadId);
+          await loadMessages(threadId);
+        }, [threadId, api, loadThread, loadMessages]);
+
+        const runNSteps = useCallback(async () => {
+          if (!threadId) return;
+          const r = await fetch(api.autorun(threadId, Math.max(1, Number(nSteps) || 1)), { method: "POST" });
+          if (!r.ok) throw new Error(`autorun failed: ${r.status}`);
+          await loadThread(threadId);
+          await loadMessages(threadId);
+        }, [threadId, api, nSteps, loadThread, loadMessages]);
+
+        const sendUserMessage = useCallback(async () => {
+          if (!composer.trim() || !threadId) return;
+          const r = await fetch(api.postMessage(threadId), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ content: composer.trim(), content_type: "text" }),
+          });
+          if (!r.ok) throw new Error(`post message failed: ${r.status}`);
+          setComposer("");
+          await loadThread(threadId);
+          await loadMessages(threadId);
+        }, [composer, threadId, api, loadThread, loadMessages]);
+
+        const doCompileP1 = useCallback(async () => {
+          if (!threadId) return;
+          const r = await fetch(api.compileP1(threadId), { method: "POST" });
+          if (!r.ok) throw new Error(`compile p1: ${r.status}`);
+          const data = await r.json();
+          setPhase1(data.artifact);
+        }, [threadId, api]);
+
+        const doCompileP2 = useCallback(async () => {
+          if (!threadId) return;
+          const r = await fetch(api.compileP2(threadId), { method: "POST" });
+          if (!r.ok) throw new Error(`compile p2: ${r.status}`);
+          const data = await r.json();
+          setPhase2(data);
+        }, [threadId, api]);
+
+        const chronologicalMessages = useMemo(() => [...messages].reverse(), [messages]);
+        const participantIds = useMemo(() => (thread?.participants || []), [thread]);
+        const participantMap = useMemo(() => {
+          const out = {};
+          for (const id of participantIds) {
+            const p = profiles[id];
+            if (p) out[id] = { name: p.name, role: p.role };
+          }
+          return out;
+        }, [participantIds, profiles]);
+
+        const nextSpeakerIdx = thread ? thread.cursor % (participantIds.length || 1) : 0;
+        const nextSpeakerId = participantIds[nextSpeakerIdx];
+
+        function fmtMessage(m) {
+          if (m.sender_type === "user") {
+            return { who: "You", text: typeof m.content === "string" ? m.content : JSON.stringify(m.content) };
+          }
+          const meta = participantMap[m.sender_agent_id] || { name: (m.sender_agent_id || "").slice(0, 6) || "Agent", role: "" };
+          let text = "";
+          let proposals;
+          let questions;
+          if (typeof m.content === "object" && m.content !== null) {
+            text = String(m.content.message ?? "");
+            proposals = Array.isArray(m.content.proposals) ? m.content.proposals : undefined;
+            questions = Array.isArray(m.content.questions) ? m.content.questions : undefined;
+          } else {
+            text = String(m.content);
+          }
+          return { who: meta.name, role: meta.role, text, proposals, questions };
+        }
+
+        return (
+          <div className="min-h-screen bg-gray-50 text-gray-900">
+            <div className="max-w-6xl mx-auto p-4 sm:p-6">
+              <header className="flex flex-col sm:flex-row gap-3 sm:items-end sm:justify-between">
+                <div>
+                  <h1 className="text-2xl font-bold">Debate Control Panel</h1>
+                  <p className="text-sm text-gray-600">Visualize and steer your multi-agent, turn-based debates.</p>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    className="border rounded px-3 py-2 w-full sm:w-72"
+                    placeholder="FastAPI base (…/debate)"
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                  />
+                  <input
+                    className="border rounded px-3 py-2 w-full sm:w-72"
+                    placeholder="Thread ID"
+                    value={threadId}
+                    onChange={(e) => setThreadId(e.target.value)}
+                  />
+                  <button
+                    className="px-4 py-2 rounded bg-gray-900 text-white hover:opacity-90"
+                    onClick={refreshAll}
+                    disabled={!threadId || loading}
+                  >
+                    {loading ? "Loading…" : "Load"}
+                  </button>
+                </div>
+              </header>
+
+              {error && <div className="mt-4 p-3 rounded bg-red-100 text-red-800 text-sm">{error}</div>}
+
+              {thread && (
+                <section className="mt-6">
+                  <div className="flex items-center justify-between">
+                    <h2 className="font-semibold">Participants</h2>
+                    <div className="text-sm text-gray-600">
+                      Phase: <span className="font-mono">{thread.phase}</span>
+                    </div>
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
+                    {participantIds.map((id, idx) => {
+                      const p = participantMap[id];
+                      const isNext = id === nextSpeakerId;
+                      return (
+                        <div key={id} className={`border rounded-xl p-3 flex items-center justify-between ${isNext ? "bg-yellow-50 border-yellow-300" : "bg-white"}`}>
+                          <div>
+                            <div className="font-medium">{p?.name || id.slice(0, 6)}</div>
+                            <div className="text-xs text-gray-600">{p?.role || "agent"}</div>
+                          </div>
+                          <div className="text-xs text-gray-500">#{idx + 1}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </section>
+              )}
+
+              <section className="mt-6">
+                <h2 className="font-semibold">Controls</h2>
+                <div className="mt-2 grid grid-cols-1 md:grid-cols-2 gap-3">
+                  <div className="border rounded-xl p-3 bg-white">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select className="border rounded px-2 py-1" value={stepMode} onChange={(e) => setStepMode(e.target.value)}>
+                        <option value="mem">Step with memory</option>
+                        <option value="plain">Plain step</option>
+                      </select>
+                      <button
+                        className="px-3 py-1.5 rounded bg-blue-600 text-white hover:opacity-90"
+                        onClick={stepOnce}
+                        disabled={!threadId}
+                        title="Shortcut: Space"
+                      >
+                        Step once
+                      </button>
+                      <div className="flex items-center gap-2">
+                        <label className="text-sm">Auto-run</label>
+                        <button
+                          className={`px-3 py-1.5 rounded ${autorun ? "bg-green-600" : "bg-gray-700"} text-white hover:opacity-90`}
+                          onClick={() => setAutorun((x) => !x)}
+                          disabled={!threadId}
+                          title="Shortcut: A"
+                        >
+                          {autorun ? "On" : "Off"}
+                        </button>
+                        <input
+                          className="border rounded px-2 py-1 w-24"
+                          type="number"
+                          min={250}
+                          step={250}
+                          value={delayMs}
+                          onChange={(e) => setDelayMs(Number(e.target.value) || 1000)}
+                        />
+                        <span className="text-sm text-gray-600">ms delay</span>
+                      </div>
+                    </div>
+                    <div className="mt-3 flex items-center gap-2">
+                      <input
+                        className="border rounded px-2 py-1 w-24"
+                        type="number"
+                        min={1}
+                        value={nSteps}
+                        onChange={(e) => setNSteps(Number(e.target.value) || 1)}
+                      />
+                      <button className="px-3 py-1.5 rounded bg-indigo-600 text-white hover:opacity-90" onClick={runNSteps} disabled={!threadId}>
+                        Run N steps
+                      </button>
+                      <button className="px-3 py-1.5 rounded bg-gray-100 text-gray-900 border" onClick={() => refreshAll()} disabled={!threadId}>
+                        Refresh
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="border rounded-xl p-3 bg-white">
+                    <div className="font-medium">Compile</div>
+                    <div className="mt-2 flex flex-wrap items-center gap-2">
+                      <button className="px-3 py-1.5 rounded bg-purple-600 text-white" onClick={doCompileP1} disabled={!threadId}>Phase-1 artifact</button>
+                      <button className="px-3 py-1.5 rounded bg-purple-700 text-white" onClick={doCompileP2} disabled={!threadId}>Phase-2 reqs+tests</button>
+                    </div>
+                    {(phase1 || phase2) && (
+                      <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-3 text-sm">
+                        {phase1 && <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{JSON.stringify(phase1, null, 2)}</pre>}
+                        {phase2 && <pre className="p-2 bg-gray-50 border rounded overflow-auto max-h-64">{JSON.stringify(phase2, null, 2)}</pre>}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              <section className="mt-6">
+                <h2 className="font-semibold">Transcript</h2>
+                <div className="mt-2 border rounded-xl bg-white">
+                  <div className="p-3 h-[420px] overflow-auto space-y-3">
+                    {chronologicalMessages.map((m, i) => {
+                      const fm = fmtMessage(m);
+                      const isUser = m.sender_type === "user";
+                      return (
+                        <div key={m.id || i} className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+                          <div className={`max-w-[80%] rounded-2xl px-3 py-2 border ${isUser ? "bg-blue-50 border-blue-200" : "bg-gray-50"}`}>
+                            <div className="text-xs text-gray-500 mb-1">
+                              {isUser ? fm.who : `${fm.who}${fm.role ? ` · ${fm.role}` : ""}`}
+                            </div>
+                            <div className="whitespace-pre-wrap">{fm.text}</div>
+                            {fm.proposals?.length > 0 && (
+                              <ul className="mt-2 list-disc pl-5 text-sm text-gray-700">
+                                {fm.proposals.map((p, idx) => <li key={idx}>Proposal: {p}</li>)}
+                              </ul>
+                            )}
+                            {fm.questions?.length > 0 && (
+                              <ul className="mt-2 list-disc pl-5 text-sm text-gray-700">
+                                {fm.questions.map((q, idx) => <li key={idx}>Question: {q}</li>)}
+                              </ul>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="border-t p-3 flex items-center gap-2">
+                    <textarea
+                      className="flex-1 border rounded-lg px-3 py-2 min-h-[44px]"
+                      placeholder="Type your message…"
+                      value={composer}
+                      onChange={(e) => setComposer(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendUserMessage();
+                      }}
+                    />
+                    <button className="px-4 py-2 rounded bg-gray-900 text-white" onClick={sendUserMessage} disabled={!threadId || !composer.trim()}>
+                      Send
+                    </button>
+                  </div>
+                </div>
+                <p className="mt-2 text-xs text-gray-500">
+                  Shortcuts: <kbd className="px-1 border rounded">Space</kbd> step once, <kbd className="px-1 border rounded">A</kbd> toggle auto-run.
+                </p>
+              </section>
+            </div>
+          </div>
+        );
+      }
+
+      ReactDOM.createRoot(document.getElementById("root")).render(<DebateControlPanel />);
+    </script>
+  </body>
+</html>
